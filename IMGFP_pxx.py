@@ -4,6 +4,10 @@ from sklearn.cluster import KMeans, MiniBatchKMeans
 from sklearn.mixture import GaussianMixture
 from sklearn.neighbors import NearestNeighbors
 
+from skimage.feature import hog, local_binary_pattern  # 导入HOG和LBP函数
+import numpy as np
+import cv2
+
 # 算法选项常量
 DEFAULT_pxx = 0
 SIFT_pxx = 0
@@ -19,6 +23,7 @@ FV_pxx = 2
 class Processor:
     def __init__(self, method=DEFAULT_pxx):
         self.method = method
+        self.feature_extractor = None
         if self.method == ORB_pxx:
             self.feature_extractor = cv2.ORB_create(
                 nfeatures=500,  # 控制特征点数量
@@ -28,9 +33,94 @@ class Processor:
             )
         else:  # 默认使用SIFT
             self.feature_extractor = cv2.SIFT_create(
-                contrastThreshold=0.01,
-                edgeThreshold=15
+                # contrastThreshold=0.01,
+                # edgeThreshold=15
             )
+
+        # 新增全局特征提取参数
+        self.color_bins = 64  # 颜色直方图分箱数
+        self.hog_params = {
+            'orientations': 9,
+            'pixels_per_cell': (8, 8),
+            'cells_per_block': (2, 2)
+        }
+
+    def extract_global_features(self, image_path):
+        """提取颜色/形状/纹理特征"""
+        # img = cv2.imread(image_path)
+        # features = {}
+        #
+        # # 颜色特征（HSV直方图）
+        # hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        # hist_color = cv2.calcHist([hsv], [0, 1], None, [self.color_bins] * 2, [0, 180, 0, 256])
+        # hist_color = cv2.normalize(hist_color, None).flatten()
+        # features['color'] = hist_color
+
+        img = cv2.imread(image_path)
+        features = {}
+
+        # 颜色特征（三维LAB直方图）
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        lab = cv2.normalize(lab, None, 0, 255, cv2.NORM_MINMAX)  # 归一化到[0,255]
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # 计算带空间加权的三维直方图
+        hist = cv2.calcHist(
+            images=[lab],
+            channels=[0, 1, 2],
+            mask=None,
+            histSize=[8, 8, 8],  # 每个通道8个bin
+            ranges=[0, 256, 0, 256, 0, 256]  # 注意每个通道的范围
+        )
+        hist = cv2.normalize(hist, None).flatten()
+        features['color'] = hist
+
+        # # 形状特征（HOG）
+        # gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # hog_feat = hog(  # 直接调用hog函数，无需feature.前缀
+        #     gray,
+        #     orientations=self.hog_params['orientations'],
+        #     pixels_per_cell=self.hog_params['pixels_per_cell'],
+        #     cells_per_block=self.hog_params['cells_per_block'],
+        #     channel_axis=None  # 灰度图无需通道轴
+        # )
+        # features['shape'] = hog_feat
+
+        self.hog_params = {
+            'orientations': 12,  # 增加方向分辨率
+            'pixels_per_cell': (16, 16),  # 增大cell尺寸
+            'cells_per_block': (3, 3),  # 扩大block范围
+            'transform_sqrt': True  # Gamma校正
+        }
+
+        # 添加PCA降维
+
+        from sklearn.decomposition import PCA
+        hog_feat = hog(  # 直接调用hog函数，无需feature.前缀
+            gray,
+            orientations=self.hog_params['orientations'],
+            pixels_per_cell=self.hog_params['pixels_per_cell'],
+            cells_per_block=self.hog_params['cells_per_block'],
+            channel_axis=None  # 灰度图无需通道轴
+        )
+
+        features['shape'] = hog_feat.astype(np.float32)  # 直接使用原始HOG特征
+
+        # 纹理特征（LBP）
+        lbp = local_binary_pattern(  # 直接调用local_binary_pattern
+            gray,
+            P=24,  # 圆形邻域采样点数
+            R=3,  # 邻域半径
+            method='uniform'  # 统一模式减少维度
+        )
+        hist_texture, _ = np.histogram(lbp, bins=256, range=(0, 256))
+        hist_texture = hist_texture.astype(np.float32)
+        features['texture'] = hist_texture
+
+        # 对HOG和LBP特征进行L2归一化，避免某些特征范围过大
+        features['shape'] = hog_feat / np.linalg.norm(hog_feat + 1e-6)
+        features['texture'] = hist_texture / np.linalg.norm(hist_texture + 1e-6)
+        return features
 
     def extract_features(self, image_path):
         """提取图像特征点和描述子"""
@@ -135,7 +225,7 @@ def create_codebook(descriptors_list, method, n_clusters):
         raise ValueError("Unsupported codebook method")
 
 
-def encode_features(descriptors, codebook, method,  enable_tf_idf=False, idf = None):
+def encode_features(descriptors, codebook, method, enable_tf_idf=False, idf=None):
     """特征编码"""
     if descriptors is None or len(descriptors) == 0:
         return None

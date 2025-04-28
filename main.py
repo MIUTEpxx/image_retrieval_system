@@ -2,6 +2,7 @@ import os
 import time
 
 import numpy as np
+from scipy import spatial
 from sklearn.preprocessing import normalize
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt
@@ -24,6 +25,10 @@ from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QLabel, QVBo
 from PyQt5.QtGui import QPixmap, QPainter
 # from PyQt5.QtChart import QChart, QChartView, QLineSeries, QValueAxis
 from PyQt5.QtCore import Qt
+
+from skimage.feature import hog, local_binary_pattern  # 导入HOG和LBP函数
+import numpy as np
+import cv2
 
 
 class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
@@ -66,6 +71,8 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         self.feature_encoding_method = IMGFP.DEFAULT_pxx
         # 是否启用TF-IDF
         self.enable_tf_idf = False
+        # 是否启用 重排序
+        self.enable_re_sort = False
         # 用于存储每个视觉单词的IDF值
         self.idf = None
         # 码本数量
@@ -110,10 +117,11 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         self.cmb_encoding_method.currentIndexChanged.connect(self.update_encoding_method)  # 特征编码算法
         self.cmb_codebook_generate.currentIndexChanged.connect(self.update_codebook_generate)  # 码本生成算法
         self.rbtn_tfidf.toggled.connect(self.update_enbal_if_idf)
+        self.rbtn_re_sort.toggled.connect(self.update_enable_re_sort)
         # 参数输入
         self.spb_codebook_size.valueChanged.connect(lambda v: setattr(self, 'codebook_count', v))
         self.spb_knn_k.valueChanged.connect(lambda v: setattr(self, 'k_value', v))
-        self.dspb_match_threshold.valueChanged.connect(lambda v: setattr(self, 'feature_matching_threshold', v))
+        # self.dspb_match_threshold.valueChanged.connect(lambda v: setattr(self, 'feature_matching_threshold', v))
 
     def start_detect(self):
         """执行图像检索"""
@@ -175,6 +183,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
             idf=self.idf if self.enable_tf_idf else None,
             enable_tf_idf=self.enable_tf_idf
         )
+
         if test_encoding is None:
             QMessageBox.warning(self, "错误", "测试图像编码失败")
             return
@@ -203,6 +212,15 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         for idx in sorted_indices:
             img_path, label = self.train_image_paths[idx]
             results.append((label, img_path, distances[idx]))
+
+        if self.enable_re_sort == 1:
+            # 启用重排序
+            initial_results = results
+            # 新增：提取测试图像的全局特征
+            test_features = processor.extract_global_features(self.test_path)
+            # 执行重排序
+            final_results = self.linear_reranking(processor,initial_results, test_features)
+            results = final_results
 
         # 显示结果图像
         self.show_result(results)
@@ -277,6 +295,49 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         self.lbl_same_class_num.setText(f"同类图像数:{sum(relevant)}")
         self.lbl_class_num.setText(f"训练集中该类图像总数:{self.class_distribution[self.current_test_label]}")
         self.lbl_pr_all.setText(f"整体Pr曲线 累计次数: {len(self.ap_history)}")
+
+    def linear_reranking(self, processor, initial_results, test_features, weights={'color': 0.3, 'shape': 0.4, 'texture': 0.3}):
+        """多特征线性融合重排序"""
+        rerank_scores = []
+        # 提前提取测试图的全局特征
+        test_color = test_features['color']
+        test_shape = test_features['shape']
+        test_texture = test_features['texture']
+
+        for idx, (label, path, base_dist) in enumerate(initial_results):
+            # 将初始距离转换为相似度（确保值域在[0,1]）
+            base_similarity = 1 / (1 + base_dist)  # 修复：使用合理的相似度转换
+            # base_similarity = np.exp(-0.5 * base_dist)  # 调整gamma参数控制衰减速度
+            # 提取候选图像的全局特征
+            candidate_features = processor.extract_global_features(path)
+
+            # 计算各特征相似度
+            # 计算颜色相似度（巴氏距离）
+            color_dist = cv2.compareHist(test_features['color'], candidate_features['color'], cv2.HISTCMP_BHATTACHARYYA)
+            color_sim = 1 - color_dist  # 距离越小，相似度越高
+            # color_sim = cv2.compareHist(test_features['color'], candidate_features['color'], cv2.HISTCMP_CORREL)
+            # 计算形状相似度（余弦相似度）
+            shape_sim = 1 - spatial.distance.cosine(test_features['shape'], candidate_features['shape'])
+            # 计算纹理相似度（余弦相似度）
+            texture_sim = 1 - spatial.distance.cosine(test_features['texture'], candidate_features['texture'])
+
+            # 对每个相似度进行归一化
+            color_sim = np.clip(color_sim, 0, 1)
+            shape_sim = (shape_sim + 1) / 2  # 余弦相似度转 [0,1]
+            texture_sim = (texture_sim + 1) / 2
+
+            # 线性组合得分
+            combined_score = (
+                    weights['color'] * color_sim +
+                    weights['shape'] * shape_sim +
+                    weights['texture'] * texture_sim +
+                    0.3 * base_similarity  # 初始检索得分的影响
+            )
+            rerank_scores.append((label, path, combined_score))
+
+        # 按降序排序
+        rerank_scores.sort(key=lambda x: -x[2])
+        return rerank_scores
 
     def show_result(self, results):
         """显示检测结果图像和信息"""
@@ -804,8 +865,12 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
     def update_enbal_if_idf(self, index):
         """更新'是否启用IF-IDF'算法"""
         self.enable_tf_idf = index
-        print(self.enable_tf_idf)
+        print("IF-IDF: " + "启用" if self.enable_tf_idf == 1 else "关闭")
 
+    def update_enable_re_sort(self, index):
+        """更新是否启用重排序"""
+        self.enable_re_sort = index
+        print("重排序: " + "启用" if self.enable_re_sort == 1 else "关闭")
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication([])  # 必须在任何 Qt 操作前初始化
