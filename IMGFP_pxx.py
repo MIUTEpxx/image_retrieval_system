@@ -10,14 +10,20 @@ import cv2
 
 # 算法选项常量
 DEFAULT_pxx = 0
+# 特征提取算法
 SIFT_pxx = 0
 ORB_pxx = 1
+# 码本生成算法
 KMEANS_pxx = 0
 VQ_pxx = 1
 GMM_pxx = 2
+# 编码算法
 VLAD_pxx = 0
 BOF_pxx = 1
 FV_pxx = 2
+# 重排序
+LC_pxx = 1  # 线性组合重排序
+CLUSTER_pxx = 2  # 基于聚类的重排序
 
 
 class Processor:

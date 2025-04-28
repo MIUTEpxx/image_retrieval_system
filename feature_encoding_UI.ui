@@ -6,7 +6,7 @@
    <rect>
     <x>0</x>
     <y>0</y>
-    <width>1345</width>
+    <width>1233</width>
     <height>934</height>
    </rect>
   </property>
@@ -129,8 +129,8 @@
               <rect>
                <x>0</x>
                <y>0</y>
-               <width>322</width>
-               <height>167</height>
+               <width>294</width>
+               <height>161</height>
               </rect>
              </property>
              <layout class="QVBoxLayout" name="verticalLayout_12">
@@ -254,7 +254,7 @@
          </layout>
         </item>
         <item>
-         <layout class="QHBoxLayout" name="horizontalLayout_2">
+         <layout class="QHBoxLayout" name="horizontalLayout_2" stretch="1,3">
           <item>
            <widget class="QLabel" name="label_11">
             <property name="text">
@@ -290,7 +290,7 @@
          </layout>
         </item>
         <item>
-         <layout class="QHBoxLayout" name="horizontalLayout">
+         <layout class="QHBoxLayout" name="horizontalLayout" stretch="1,3">
           <item>
            <widget class="QLabel" name="label_4">
             <property name="text">
@@ -326,22 +326,48 @@
          </layout>
         </item>
         <item>
+         <layout class="QHBoxLayout" name="horizontalLayout_9" stretch="1,3">
+          <item>
+           <widget class="QLabel" name="label">
+            <property name="text">
+             <string>重排序算法:</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QComboBox" name="cmb_re_sort">
+            <property name="minimumSize">
+             <size>
+              <width>0</width>
+              <height>30</height>
+             </size>
+            </property>
+            <item>
+             <property name="text">
+              <string>不启用</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>基于颜色,形状,纹理的线性组合</string>
+             </property>
+            </item>
+            <item>
+             <property name="text">
+              <string>基于聚类</string>
+             </property>
+            </item>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
          <widget class="QRadioButton" name="rbtn_tfidf">
           <property name="text">
            <string>启用TF-IDF</string>
           </property>
           <property name="checkable">
            <bool>true</bool>
-          </property>
-          <property name="autoExclusive">
-           <bool>false</bool>
-          </property>
-         </widget>
-        </item>
-        <item>
-         <widget class="QRadioButton" name="rbtn_re_sort">
-          <property name="text">
-           <string>启用重排序</string>
           </property>
           <property name="autoExclusive">
            <bool>false</bool>
@@ -475,7 +501,7 @@
               <rect>
                <x>0</x>
                <y>0</y>
-               <width>483</width>
+               <width>441</width>
                <height>213</height>
               </rect>
              </property>

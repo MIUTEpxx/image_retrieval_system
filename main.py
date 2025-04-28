@@ -3,6 +3,7 @@ import time
 
 import numpy as np
 from scipy import spatial
+from sklearn.cluster import MiniBatchKMeans
 from sklearn.preprocessing import normalize
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt
@@ -72,7 +73,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         # 是否启用TF-IDF
         self.enable_tf_idf = False
         # 是否启用 重排序
-        self.enable_re_sort = False
+        self.re_sort_method = 0
         # 用于存储每个视觉单词的IDF值
         self.idf = None
         # 码本数量
@@ -116,8 +117,9 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         self.cmb_feature_extractor.currentIndexChanged.connect(self.update_feature_extractor)  # 特征提取算法
         self.cmb_encoding_method.currentIndexChanged.connect(self.update_encoding_method)  # 特征编码算法
         self.cmb_codebook_generate.currentIndexChanged.connect(self.update_codebook_generate)  # 码本生成算法
+        self.cmb_re_sort.currentIndexChanged.connect(self.update_enable_re_sort)
         self.rbtn_tfidf.toggled.connect(self.update_enbal_if_idf)
-        self.rbtn_re_sort.toggled.connect(self.update_enable_re_sort)
+        # self.rbtn_re_sort.toggled.connect(self.update_enable_re_sort)
         # 参数输入
         self.spb_codebook_size.valueChanged.connect(lambda v: setattr(self, 'codebook_count', v))
         self.spb_knn_k.valueChanged.connect(lambda v: setattr(self, 'k_value', v))
@@ -208,18 +210,28 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         sorted_indices = nearest_indices[np.argsort(distances[nearest_indices])]
 
         # 构建结果列表
-        results = []  # 格式 [(绝对路径,类别,相似度)]
+        results = []  # 格式 [(绝对路径,类别,相似度,idx)]
         for idx in sorted_indices:
             img_path, label = self.train_image_paths[idx]
-            results.append((label, img_path, distances[idx]))
+            results.append((label, img_path, distances[idx], idx))
 
-        if self.enable_re_sort == 1:
-            # 启用重排序
-            initial_results = results
-            # 新增：提取测试图像的全局特征
+        if self.re_sort_method == IMGFP.CLUSTER_pxx:
+            # 基于聚类的重排序
+            results = self.reorder_results(results, test_encoding)
+
+        # 更改格式以适应后续代码 # 格式 [(绝对路径,类别,相似度)]
+        results_ = []
+        for result in results:
+            label, path, dist, _ = result
+            results_.append((label, path, dist))
+
+        results = results_
+
+        if self.re_sort_method == IMGFP.LC_pxx:
+            # 启用基于线性组合的重排序
             test_features = processor.extract_global_features(self.test_path)
             # 执行重排序
-            final_results = self.linear_reranking(processor,initial_results, test_features)
+            final_results = self.linear_reranking(processor, results, test_features)
             results = final_results
 
         # 显示结果图像
@@ -296,46 +308,148 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         self.lbl_class_num.setText(f"训练集中该类图像总数:{self.class_distribution[self.current_test_label]}")
         self.lbl_pr_all.setText(f"整体Pr曲线 累计次数: {len(self.ap_history)}")
 
-    def linear_reranking(self, processor, initial_results, test_features, weights={'color': 0.3, 'shape': 0.4, 'texture': 0.3}):
-        """多特征线性融合重排序"""
+    def reorder_results(self, results, test_encoding):
+        """基于聚类的重排序方法"""
+        if not results:
+            return results
+
+        # 提取特征和验证有效性
+        features = []
+        valid_results = []
+        for result in results:
+            label, path, dist, idx = result
+            if idx < len(self.train_encodings):
+                feature = self.train_encodings[idx]
+                if feature is not None:
+                    features.append(feature)
+                    valid_results.append(result)
+
+        if len(features) < 2:  # 至少需要两个样本才能聚类
+            return results
+
+        # 动态确定聚类数（基于样本数量和轮廓系数）
+        max_clusters = min(10, len(features) // 2)  # 最多10个簇或样本数一半
+        min_clusters = 2
+        best_score = -1
+        best_labels = None
+        kmeans = None
+
+        # 评估不同聚类数
+        for n_clusters in range(min_clusters, max_clusters + 1):
+            try:
+                kmeans = MiniBatchKMeans(n_clusters=n_clusters, batch_size=100, random_state=0)
+                labels = kmeans.fit_predict(features)
+
+                # 计算轮廓系数（仅当n_clusters > 1）
+                if n_clusters > 1:
+                    from sklearn.metrics import silhouette_score
+                    score = silhouette_score(features, labels)
+                    if score > best_score:
+                        best_score = score
+                        best_labels = labels
+            except:
+                print("出错!!!!!")
+                continue
+
+            # 如果没有找到合适聚类，退回原始顺序
+        if best_labels is None:
+            return results
+
+        # 获取最佳聚类标签
+        cluster_labels = best_labels
+        cluster_centers = kmeans.cluster_centers_
+
+        # 计算每个簇的综合得分（结合中心相似度和簇内一致性）
+        test_feature = test_encoding.reshape(1, -1)
+        cluster_scores = []
+        for k in range(len(cluster_centers)):
+            # 中心相似度
+            center_sim = 1 / (1 + np.linalg.norm(cluster_centers[k] - test_feature))
+
+            # 簇内平均相似度（处理空簇）
+            cluster_features = [features[i] for i, lbl in enumerate(cluster_labels) if lbl == k]
+            if len(cluster_features) == 0:
+                intra_sim = center_sim  # 空簇时使用中心相似度代替
+            else:
+                intra_sim = np.mean([1 / (1 + np.linalg.norm(f - test_feature)) for f in cluster_features])
+
+            # 综合得分（可调权重）
+            score = 0.6 * center_sim + 0.4 * intra_sim
+            cluster_scores.append(score)
+
+        # 按综合得分排序簇
+        sorted_cluster_indices = np.argsort(cluster_scores)[::-1]  # 降序
+
+        # 重新组织结果（优先高得分簇，簇内按原始距离排序）
+        reordered = []
+        for cluster_idx in sorted_cluster_indices:
+            # 获取当前簇结果
+            cluster_results = [res for res, lbl in zip(valid_results, cluster_labels) if lbl == cluster_idx]
+            # 簇内按原始距离排序
+            cluster_results_sorted = sorted(cluster_results, key=lambda x: x[2])
+            reordered.extend(cluster_results_sorted)
+
+        return reordered
+
+    def linear_reranking(self, processor, initial_results, test_features,
+                         weights={'color': 0.25, 'shape': 0.35, 'texture': 0.25, 'context': 0.15}):
+        """增强版线性融合重排序"""
         rerank_scores = []
-        # 提前提取测试图的全局特征
+
+        # 提前计算测试图全局特征
         test_color = test_features['color']
         test_shape = test_features['shape']
         test_texture = test_features['texture']
 
+        # 计算上下文相似度（同类图像占比）
+        class_counter = {}
+        for label, _, _ in initial_results:
+            class_counter[label] = class_counter.get(label, 0) + 1
+        total = len(initial_results)
+
         for idx, (label, path, base_dist) in enumerate(initial_results):
-            # 将初始距离转换为相似度（确保值域在[0,1]）
-            base_similarity = 1 / (1 + base_dist)  # 修复：使用合理的相似度转换
-            # base_similarity = np.exp(-0.5 * base_dist)  # 调整gamma参数控制衰减速度
-            # 提取候选图像的全局特征
+            # 基础相似度转换
+            base_sim = 1 / (1 + base_dist)
+
+            # 提取候选图全局特征
             candidate_features = processor.extract_global_features(path)
 
-            # 计算各特征相似度
-            # 计算颜色相似度（巴氏距离）
-            color_dist = cv2.compareHist(test_features['color'], candidate_features['color'], cv2.HISTCMP_BHATTACHARYYA)
-            color_sim = 1 - color_dist  # 距离越小，相似度越高
-            # color_sim = cv2.compareHist(test_features['color'], candidate_features['color'], cv2.HISTCMP_CORREL)
-            # 计算形状相似度（余弦相似度）
-            shape_sim = 1 - spatial.distance.cosine(test_features['shape'], candidate_features['shape'])
-            # 计算纹理相似度（余弦相似度）
-            texture_sim = 1 - spatial.distance.cosine(test_features['texture'], candidate_features['texture'])
+            # 颜色相似度（改进巴氏距离）
+            color_sim = 1 - cv2.compareHist(test_color, candidate_features['color'],
+                                            cv2.HISTCMP_BHATTACHARYYA)
 
-            # 对每个相似度进行归一化
-            color_sim = np.clip(color_sim, 0, 1)
-            shape_sim = (shape_sim + 1) / 2  # 余弦相似度转 [0,1]
-            texture_sim = (texture_sim + 1) / 2
+            # 形状相似度（HOG余弦相似度）
+            shape_sim = 1 - spatial.distance.cosine(test_shape, candidate_features['shape'])
 
-            # 线性组合得分
+            # 纹理相似度（LBP卡方检验）
+            texture_sim = cv2.compareHist(test_texture.astype(np.float32),
+                                          candidate_features['texture'].astype(np.float32),
+                                          cv2.HISTCMP_CHISQR)
+            texture_sim = 1 / (1 + texture_sim)  # 转换到[0,1]
+
+            # 上下文相似度（同类结果占比）
+            context_sim = class_counter[label] / total
+
+            # 动态权重调整（如果颜色差异过大则降低颜色权重）
+            if color_sim < 0.3:
+                adj_weights = weights.copy()
+                adj_weights['color'] *= 0.5
+                adj_weights['shape'] += weights['color'] * 0.5
+            else:
+                adj_weights = weights
+
+            # 综合得分
             combined_score = (
-                    weights['color'] * color_sim +
-                    weights['shape'] * shape_sim +
-                    weights['texture'] * texture_sim +
-                    0.3 * base_similarity  # 初始检索得分的影响
+                    adj_weights['color'] * color_sim +
+                    adj_weights['shape'] * shape_sim +
+                    adj_weights['texture'] * texture_sim +
+                    adj_weights['context'] * context_sim +
+                    0.2 * base_sim  # 保留基础相似度影响
             )
+
             rerank_scores.append((label, path, combined_score))
 
-        # 按降序排序
+        # 按综合得分降序排序
         rerank_scores.sort(key=lambda x: -x[2])
         return rerank_scores
 
@@ -346,7 +460,12 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         item_size = QtCore.QSize(200, 150)  # 统一项目尺寸
         self.list_results.setGridSize(item_size)
 
-        for label, path, dist in results:
+        for result in results:
+            # 解包不同长度的结果
+            if len(result) == 4:
+                label, path, dist, _ = result
+            else:
+                label, path, dist = result
             # 创建列表项和对应的widget
             item = QtWidgets.QListWidgetItem()
             widget = self._create_result_item(label, path, dist)
@@ -860,7 +979,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
             self.feature_encoding_method = IMGFP.FV_pxx
             self.cmb_encoding_method.setCurrentIndex(IMGFP.FV_pxx)  # 更改UI显示
 
-        print(f"当前码本生成方法: {self.cmb_encoding_method.itemText(index)}")
+        print(f"当前码本生成方法: {self.cmb_codebook_generate.itemText(index)}")
 
     def update_enbal_if_idf(self, index):
         """更新'是否启用IF-IDF'算法"""
@@ -868,9 +987,15 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         print("IF-IDF: " + "启用" if self.enable_tf_idf == 1 else "关闭")
 
     def update_enable_re_sort(self, index):
-        """更新是否启用重排序"""
-        self.enable_re_sort = index
-        print("重排序: " + "启用" if self.enable_re_sort == 1 else "关闭")
+        """更新重排序算法"""
+        self.re_sort_method = index
+        if self.re_sort_method == 0:
+            print("关闭重排序重排序")
+        elif self.re_sort_method == IMGFP.LC_pxx:
+            print("启用基于线性组合的重排序算法")
+        elif self.re_sort_method == IMGFP.CLUSTER_pxx:
+            print("启用基于聚类的重排序算法")
+
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication([])  # 必须在任何 Qt 操作前初始化
