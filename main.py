@@ -55,6 +55,8 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
 
         # 存储测试图片的编码
         self.test_encoding = None
+        # 储存训练集图像的特征编码, 通过训练图像文件的路径来映射
+        self.all_descriptors = {}
         # 存储训练集生成的码本
         self.train_codebook = None
         # 存储所有训练图的编码
@@ -72,8 +74,10 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         self.feature_encoding_method = IMGFP.DEFAULT_pxx
         # 是否启用TF-IDF
         self.enable_tf_idf = False
-        # 是否启用 重排序
+        # 是否启用 重排序/重排序类型:1~2
         self.re_sort_method = 0
+        # 是否启用 扩展查询
+        self.enable_qe = False
         # 用于存储每个视觉单词的IDF值
         self.idf = None
         # 码本数量
@@ -119,6 +123,8 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         self.cmb_codebook_generate.currentIndexChanged.connect(self.update_codebook_generate)  # 码本生成算法
         self.cmb_re_sort.currentIndexChanged.connect(self.update_enable_re_sort)
         self.rbtn_tfidf.toggled.connect(self.update_enbal_if_idf)
+        self.rbtn_qe.toggled.connect(self.update_enbal_qe)
+
         # self.rbtn_re_sort.toggled.connect(self.update_enable_re_sort)
         # 参数输入
         self.spb_codebook_size.valueChanged.connect(lambda v: setattr(self, 'codebook_count', v))
@@ -170,16 +176,19 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
     def detect_image(self):
         # 开始计时
         start_time = time.time()  # 开始计时
+        temp_descriptors = []  # 用于临时储存测试图和结果图的特征 用于后续扩展查询
         """测试图特征提取与编码"""
         processor = IMGFP.Processor(self.feature_extraction_method)
-        _, desc = processor.extract_features(self.test_path)
-        if desc is None:
+        _, test_desc = processor.extract_features(self.test_path)
+        if test_desc is None:
             QMessageBox.warning(self, "错误", "无法提取测试图像特征")
             return
 
+        temp_descriptors.append(test_desc)  # 保存测试图像的特征
+
         # 生成测试编码
         test_encoding = IMGFP.encode_features(
-            desc,
+            test_desc,
             self.train_codebook,
             self.feature_encoding_method,
             idf=self.idf if self.enable_tf_idf else None,
@@ -204,7 +213,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
 
         distances = np.linalg.norm(train_encodings - test_encoding, axis=1)  # 欧氏距离
 
-        #  获取Top-K结果
+        """获取Top-K结果"""
         k = min(self.k_value, len(distances))
         nearest_indices = np.argpartition(distances, k)[:k]
         sorted_indices = nearest_indices[np.argsort(distances[nearest_indices])]
@@ -213,8 +222,124 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         results = []  # 格式 [(绝对路径,类别,相似度,idx)]
         for idx in sorted_indices:
             img_path, label = self.train_image_paths[idx]
+            temp_descriptors.append(self.all_descriptors.get(img_path))  # 保存检索结果图像的特征
             results.append((label, img_path, distances[idx], idx))
 
+        """是否进行扩展查询"""
+        if self.enable_qe is True:
+            # 检查有效性
+            if not temp_descriptors:
+                QMessageBox.warning(self, "错误", "扩展查询失败：无可用特征")
+                return
+            try:
+                # ================== 阶段1：获取候选结果 ==================
+                # 获取前K个结果的路径和索引（包含测试图自身）
+                topk_indices = sorted_indices[:self.k_value]
+                topk_paths = [self.test_path]  # 包含查询图像自身
+                for idx in topk_indices:
+                    path, _ = self.train_image_paths[idx]
+                    topk_paths.append(path)
+
+                # ================== 阶段2：几何验证 ==================
+                # 初始化几何验证参数
+                min_inliers = 10  # 最小内点数阈值
+                validated_paths = [self.test_path]  # 始终包含原查询图
+
+                # 加载查询图的特征点
+                query_kp, query_desc = processor.extract_features(self.test_path)
+                if query_desc is not None:
+                    # 创建BFMatcher
+                    bf = cv2.BFMatcher(cv2.NORM_L2)
+                    for cand_path in topk_paths[1:]:  # 跳过查询图自身
+                        # 提取候选图特征
+                        cand_kp, cand_desc = processor.extract_features(cand_path)
+                        if cand_desc is None:
+                            continue
+
+                        # 特征匹配
+                        matches = bf.knnMatch(query_desc, cand_desc, k=2)
+                        # 应用比率测试
+                        good = []
+                        for m, n in matches:
+                            if m.distance < 0.75 * n.distance:
+                                good.append(m)
+                        if len(good) < min_inliers:
+                            continue  # 跳过低质量匹配
+
+                        # 进行单应性矩阵验证
+                        src_pts = np.float32([query_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                        dst_pts = np.float32([cand_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+                        _, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+                        if mask.sum() > min_inliers:  # 有效几何验证
+                            validated_paths.append(cand_path)
+
+                # ================== 阶段3：动态权重计算 ==================
+                # 获取验证通过的编码向量
+                validated_encodings = [test_encoding.ravel()]  # 展平为1D数组 查询图编码
+                validated_sims = [1.0]  # 查询图自身相似度设为1
+                for path in validated_paths[1:]:
+                    # 添加安全检查
+                    try:
+                        idx_in_train = next(i for i, (p, _) in enumerate(self.train_image_paths) if p == path)
+                        encoding = self.train_encodings[idx_in_train]
+
+                        # 统一维度处理
+                        if encoding.ndim == 2:
+                            encoding = encoding.ravel()  # 展平为1D
+                        elif encoding.ndim != 1:
+                            raise ValueError(f"无效编码维度：{encoding.shape}")
+
+                        validated_encodings.append(encoding)
+                        validated_sims.append(1 - distances[idx_in_train])
+                    except (StopIteration, IndexError):
+                        print(f"警告：未找到路径 {path} 的编码")
+                        continue
+
+                # for path in validated_paths[1:]:
+                #     # 在训练集中查找对应的编码
+                #     idx_in_train = next(i for i, (p, _) in enumerate(self.train_image_paths) if p == path)
+                #     encoding = self.train_encodings[idx_in_train]
+                #     sim = 1 - distances[idx_in_train]  # 转换为相似度
+                #     validated_encodings.append(encoding)
+                #     validated_sims.append(sim)
+
+                # 动态调整K值（至少保留3个样本）
+                K = max(3, int(len(validated_encodings) * 0.7))  # 保留70%的验证结果
+
+                # 计算权重（softmax归一化）
+                weights = np.exp(validated_sims) / np.sum(np.exp(validated_sims))
+
+                # ================== 阶段4：加权特征融合 ==================
+                # 转换前检查所有编码长度
+                dim_sizes = {e.shape[0] for e in validated_encodings}
+                if len(dim_sizes) != 1:
+                    raise ValueError(f"编码维度不一致：发现不同长度 {dim_sizes}")
+                stacked_encodings = np.array(validated_encodings)[:K]
+                stacked_weights = weights[:K]
+
+                # 加权平均
+                avg_encoding = np.average(stacked_encodings, axis=0, weights=stacked_weights)
+                avg_encoding = normalize(avg_encoding.reshape(1, -1), norm='l2', axis=1)
+
+                # ================== 阶段5：重计算距离并再次进行图像检索 ==================
+                distances = np.linalg.norm(self.train_encodings - avg_encoding, axis=1)
+
+                # 扩展查询 再次获取前K个结果
+                nearest_indices = np.argpartition(distances, k)[:k]
+                sorted_indices = nearest_indices[np.argsort(distances[nearest_indices])]
+
+                # 构建结果列表
+                results.clear()
+                for idx in sorted_indices:
+                    img_path, label = self.train_image_paths[idx]
+                    results.append((label, img_path, distances[idx], idx))
+
+            except Exception as e:
+                QMessageBox.warning(self, "错误", f"扩展查询失败: {str(e)}")
+                print( f"扩展查询失败: {str(e)}")
+                return
+
+        """是否重排序"""
         if self.re_sort_method == IMGFP.CLUSTER_pxx:
             # 基于聚类的重排序
             results = self.reorder_results(results, test_encoding)
@@ -603,7 +728,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         )
 
     def select_test_image(self):
-        """选择测试图片"""
+        """选择测试图片 or 测试集"""
         if self.class_labels is None or self.class_labels == []:
             QMessageBox.warning(self, "注意", "请先选择训练集")
             return
@@ -801,7 +926,8 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
             self.lbl_progress_info.setText("训练集特征提取中")
             num = 0  # 已处理的图像数量
             processor = IMGFP.Processor(self.feature_extraction_method)  # 创建图像特征处理器
-            all_descriptors = []
+            self.all_descriptors = {}
+            descriptors = []
             self.train_image_paths = []  # 重置路径
 
             # 重新扫描训练集目录 进度条占30%
@@ -811,12 +937,13 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
                     continue
                 for img_file in os.listdir(class_dir):  # 扫描子目录下的图片文件
                     img_path = os.path.join(class_dir, img_file)
-                    # 提取图像特征 (SIFT)
+                    # 提取图像特征 (SIFT/ORB)
                     _, desc = processor.extract_features(img_path)
                     if desc is not None:
-                        all_descriptors.append(desc)
+                        self.all_descriptors[img_path] = desc  # 保存每个训练图像的特征(通过文件路径实现映射)
+                        descriptors.append(desc)
                         self.train_image_paths.append((img_path, class_name))
-                    # 更新进度条  待实现
+                    # 更新进度条
                     num = num + 1
                     self.progress_bar.setValue(int(num * 30 / self.total_images))
             num = 0  # 进度条分子重置
@@ -824,12 +951,12 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
             # 生成码本 进度条占30%
             self.lbl_progress_info.clear()  # 更新进度条提示文本
             self.lbl_progress_info.setText("训练集码本生成中")
-            if len(all_descriptors) == 0:
+            if len(descriptors) == 0:
                 QMessageBox.critical(self, "错误", "无法提取任何训练特征！")
                 return
 
             self.train_codebook = IMGFP.create_codebook(
-                all_descriptors,
+                descriptors,
                 self.codebook_generate_method,
                 self.codebook_count,
             )
@@ -985,6 +1112,11 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         """更新'是否启用IF-IDF'算法"""
         self.enable_tf_idf = index
         print("IF-IDF: " + "启用" if self.enable_tf_idf == 1 else "关闭")
+
+    def update_enbal_qe(self, index):
+        """更新'是否启用扩展查询QE'"""
+        self.enable_qe = index
+        print("扩展查询QE: " + "启用" if self.enable_qe == 1 else "关闭")
 
     def update_enable_re_sort(self, index):
         """更新重排序算法"""
