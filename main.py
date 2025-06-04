@@ -116,6 +116,8 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         self.btn_select_train_dir.clicked.connect(self.select_train_dir)  # 选择训练集路径
         self.btn_detect_image.clicked.connect(self.start_detect)  # 开始检测
         self.btn_clear_result.clicked.connect(self.clear_result)  # 清除结果数据
+        self.btn_save_training.clicked.connect(self.save_training_data)  # 保存训练结果
+        self.btn_load_training.clicked.connect(self.load_training_data)  # 加载训练结果
 
         # 算法选择
         self.cmb_feature_extractor.currentIndexChanged.connect(self.update_feature_extractor)  # 特征提取算法
@@ -240,16 +242,16 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
                     path, _ = self.train_image_paths[idx]
                     topk_paths.append(path)
 
-                # ================== 阶段2：几何验证 ==================
+                # ================== 阶段2：几何验证 ,通过几何一致性验证，筛选出与查询图像在空间结构上一致的图像，排除误匹配==================
                 # 初始化几何验证参数
-                min_inliers = 10  # 最小内点数阈值
+                min_inliers = 10  # 最小内点数阈值 内点(inliers)：符合几何变换关系的匹配点 如果匹配点数量超过阈值（min_inliers=10），则认为候选图片A是有效的
                 validated_paths = [self.test_path]  # 始终包含原查询图
 
                 # 加载查询图的特征点
                 query_kp, query_desc = processor.extract_features(self.test_path)
                 if query_desc is not None:
                     # 创建BFMatcher
-                    bf = cv2.BFMatcher(cv2.NORM_L2)
+                    bf = cv2.BFMatcher(cv2.NORM_L2)  # 暴力匹配器，用于快速匹配特征点
                     for cand_path in topk_paths[1:]:  # 跳过查询图自身
                         # 提取候选图特征
                         cand_kp, cand_desc = processor.extract_features(cand_path)
@@ -258,7 +260,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
 
                         # 特征匹配
                         matches = bf.knnMatch(query_desc, cand_desc, k=2)
-                        # 应用比率测试
+                        # 应用比率测试 过滤掉不可靠的匹配（只保留最独特的匹配）
                         good = []
                         for m, n in matches:
                             if m.distance < 0.75 * n.distance:
@@ -266,7 +268,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
                         if len(good) < min_inliers:
                             continue  # 跳过低质量匹配
 
-                        # 进行单应性矩阵验证
+                        # 进行单应性矩阵验证 使用RANSAC算法估计两张图片之间的几何变换关系
                         src_pts = np.float32([query_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
                         dst_pts = np.float32([cand_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
                         _, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
@@ -294,14 +296,6 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
                     except (StopIteration, IndexError):
                         print(f"警告：未找到路径 {path} 的编码")
                         continue
-
-                # for path in validated_paths[1:]:
-                #     # 在训练集中查找对应的编码
-                #     idx_in_train = next(i for i, (p, _) in enumerate(self.train_image_paths) if p == path)
-                #     encoding = self.train_encodings[idx_in_train]
-                #     sim = 1 - distances[idx_in_train]  # 转换为相似度
-                #     validated_encodings.append(encoding)
-                #     validated_sims.append(sim)
 
                 # 动态调整K值（至少保留3个样本）
                 K = max(3, int(len(validated_encodings) * 0.7))  # 保留70%的验证结果
@@ -336,7 +330,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
 
             except Exception as e:
                 QMessageBox.warning(self, "错误", f"扩展查询失败: {str(e)}")
-                print( f"扩展查询失败: {str(e)}")
+                print(f"扩展查询失败: {str(e)}")
                 return
 
         """是否重排序"""
@@ -473,7 +467,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
                         best_score = score
                         best_labels = labels
             except:
-                print("出错!!!!!")
+                print("聚类的重排序, 出错!!!!!")
                 continue
 
             # 如果没有找到合适聚类，退回原始顺序
@@ -696,6 +690,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
             if len(recalls_sorted) == 0:
                 continue
             min_precision = precisions_sorted[0]
+            max_recall = recalls_sorted[-1]  # 当前记录的最大召回值
 
             # 插值时使用当前记录首点精度作为左边界
             interp_prec = np.interp(
@@ -703,8 +698,13 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
                 recalls_sorted,
                 precisions_sorted,
                 left=min_precision,  # 使用当前记录的最小召回点精度
-                right=0.0
+                right=precisions_sorted[-1] if len(precisions_sorted) > 0 else min_precision  # 使用当前记录的最大召回点精度
             )
+            # 对于超出当前记录最大召回值的点，保持最大召回点的精度值
+            # 这样可以避免曲线垂直下降到0
+            interp_prec[recall_levels > max_recall] = precisions_sorted[-1] if (
+                    len(precisions_sorted) > 0) else min_precision
+
             interp_precisions.append(interp_prec)
 
         # 计算平均精度时忽略全零数据
@@ -712,7 +712,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         if not valid_precisions:
             return
 
-        avg_precision = np.mean(valid_precisions, axis=0)
+        avg_precision = np.mean(valid_precisions, axis=0)  # 平均值计算
         current_map = self.map_value
 
         # 裁剪有效范围（从第一个非零点开始）
@@ -866,17 +866,6 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
 
             # 重置各指标值
             self.clear_result()
-            # self.lbl_detect_time.setText(f"耗时：")
-            # self.lbl_accuracy.setText(f"精度：")
-            # self.lbl_recall.setText(f"召回率：")
-            # self.lbl_ap.setText(f"A P值:")
-            # self.lbl_map.setText(f"MAP值:")
-            # self.lbl_result_num.setText("结果图像数:")
-            # self.lbl_same_class_num.setText("同类图像数:")
-            # # if self.current_test_label is not None and self.class_distribution[]:
-            # self.lbl_class_num.setText("训练集中该类图像总数:")
-            # self.ap_history.clear()
-            # self.map_value = 0
 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"读取训练集失败: {str(e)}")
@@ -1014,6 +1003,36 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
             self.train_encodings = np.array(valid_encodings)
             QMessageBox.information(self, "成功", f"训练完成！码本尺寸：{len(self.train_codebook)}")
 
+            # 自动保存训练数据
+            try:
+                import pickle
+                filename = self.get_training_filename()
+                file_path = os.path.join(os.getcwd(), filename)
+
+                training_data = {
+                    'train_path': self.train_path,
+                    'class_labels': self.class_labels,
+                    'class_distribution': self.class_distribution,
+                    'train_image_paths': self.train_image_paths,
+                    'train_codebook': self.train_codebook,
+                    'train_encodings': self.train_encodings,
+                    'idf': self.idf,
+                    'all_descriptors': self.all_descriptors,
+                    'feature_extraction_method': self.feature_extraction_method,
+                    'codebook_generate_method': self.codebook_generate_method,
+                    'feature_encoding_method': self.feature_encoding_method,
+                    'codebook_count': self.codebook_count,
+                    'enable_tf_idf': self.enable_tf_idf
+                }
+
+                with open(file_path, 'wb') as f:
+                    pickle.dump(training_data, f)
+
+                self.lbl_progress_info.setText(f"训练数据已自动保存: {filename}")
+
+            except Exception as e:
+                QMessageBox.warning(self, "警告", f"自动保存失败: {str(e)}")
+
         except Exception as e:
             QMessageBox.critical(self, "错误", f"训练失败：{str(e)}")
         finally:
@@ -1027,6 +1046,106 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         old_info = self.lbl_train_dir_info.text()
         new_info = old_info + '\n' + info
         self.lbl_train_dir_info.setText(new_info)
+
+    def get_training_filename(self):
+        """生成包含算法信息的训练数据文件名"""
+        fe_method = {IMGFP.SIFT_pxx: 'SIFT', IMGFP.ORB_pxx: 'ORB'}.get(self.feature_extraction_method, 'DEFAULT')
+        cb_method = {IMGFP.KMEANS_pxx: 'KMEANS', IMGFP.VQ_pxx: 'VQ', IMGFP.GMM_pxx: 'GMM'}.get(
+            self.codebook_generate_method, 'DEFAULT')
+        enc_method = {IMGFP.VLAD_pxx: 'VLAD', IMGFP.BOF_pxx: 'BOF', IMGFP.FV_pxx: 'FV'}.get(
+            self.feature_encoding_method, 'DEFAULT')
+        tfidf_flag = 'TFIDF' if self.enable_tf_idf else 'noTFIDF'
+
+        return f"training_{fe_method}_{cb_method}_{enc_method}_{self.codebook_count}_{tfidf_flag}.pkl"
+
+    def save_training_data(self):
+        """保存训练数据到文件"""
+        if not self.train_path or self.train_codebook is None:
+            QMessageBox.warning(self, "错误", "没有训练数据可保存")
+            return
+
+        # 生成文件名
+        filename = self.get_training_filename()
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "保存训练数据", filename, "Pickle Files (*.pkl)"
+        )
+
+        if not file_path:
+            return
+
+        # 准备保存的数据
+        training_data = {
+            'train_path': self.train_path,
+            'class_labels': self.class_labels,
+            'class_distribution': self.class_distribution,
+            'train_image_paths': self.train_image_paths,
+            'train_codebook': self.train_codebook,
+            'train_encodings': self.train_encodings,
+            'idf': self.idf,
+            'all_descriptors': self.all_descriptors,
+            'feature_extraction_method': self.feature_extraction_method,
+            'codebook_generate_method': self.codebook_generate_method,
+            'feature_encoding_method': self.feature_encoding_method,
+            'codebook_count': self.codebook_count,
+            'enable_tf_idf': self.enable_tf_idf
+        }
+
+        # 保存数据
+        try:
+            import pickle
+            with open(file_path, 'wb') as f:
+                pickle.dump(training_data, f)
+            QMessageBox.information(self, "成功", f"训练数据已保存到:\n{file_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存失败: {str(e)}")
+
+    def load_training_data(self):
+        """从文件加载训练数据"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "加载训练数据", "", "Pickle Files (*.pkl)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            import pickle
+            with open(file_path, 'rb') as f:
+                training_data = pickle.load(f)
+
+            # 恢复训练数据
+            self.train_path = training_data['train_path']
+            self.class_labels = training_data['class_labels']
+            self.class_distribution = training_data['class_distribution']
+            self.train_image_paths = training_data['train_image_paths']
+            self.train_codebook = training_data['train_codebook']
+            self.train_encodings = training_data['train_encodings']
+            self.idf = training_data['idf']
+            self.all_descriptors = training_data['all_descriptors']
+            self.feature_extraction_method = training_data['feature_extraction_method']
+            self.codebook_generate_method = training_data['codebook_generate_method']
+            self.feature_encoding_method = training_data['feature_encoding_method']
+            self.codebook_count = training_data['codebook_count']
+            self.enable_tf_idf = training_data['enable_tf_idf']
+
+            # 更新UI
+            total_images = sum(self.class_distribution.values())
+            self._update_train_ui(total_images)  # 更新训练集目录信息
+
+            # 更新算法选择控件的当前索引
+            self.cmb_feature_extractor.setCurrentIndex(self.feature_extraction_method)
+            self.cmb_codebook_generate.setCurrentIndex(self.codebook_generate_method)
+            self.cmb_encoding_method.setCurrentIndex(self.feature_encoding_method)
+            self.spb_codebook_size.setValue(self.codebook_count)
+            self.rbtn_tfidf.setChecked(self.enable_tf_idf)
+
+            # 启用检测按钮
+            self.btn_detect_image.setEnabled(True)
+
+            QMessageBox.information(self, "成功", "训练数据加载成功！")
+
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"加载失败: {str(e)}")
 
     def clear_result(self):
         """清除检索结果数据"""
