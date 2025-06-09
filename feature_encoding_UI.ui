@@ -310,11 +310,6 @@
               <string>VQ</string>
              </property>
             </item>
-            <item>
-             <property name="text">
-              <string>GMM (需搭配FV使用)(不可用)</string>
-             </property>
-            </item>
            </widget>
           </item>
          </layout>
@@ -344,11 +339,6 @@
             <item>
              <property name="text">
               <string>BoF</string>
-             </property>
-            </item>
-            <item>
-             <property name="text">
-              <string>FV (需搭配GMM使用)(不可用)</string>
              </property>
             </item>
            </widget>
@@ -384,7 +374,7 @@
             </item>
             <item>
              <property name="text">
-              <string>基于聚类</string>
+              <string>基于几何验证</string>
              </property>
             </item>
            </widget>

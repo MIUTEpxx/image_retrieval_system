@@ -466,7 +466,7 @@ class Ui_window_feature_encoding(object):
         self.label.setText(_translate("window_feature_encoding", "重排序算法:"))
         self.cmb_re_sort.setItemText(0, _translate("window_feature_encoding", "不启用"))
         self.cmb_re_sort.setItemText(1, _translate("window_feature_encoding", "基于颜色,形状,纹理的线性组合"))
-        self.cmb_re_sort.setItemText(2, _translate("window_feature_encoding", "基于聚类"))
+        self.cmb_re_sort.setItemText(2, _translate("window_feature_encoding", "基于几何验证"))
         self.rbtn_tfidf.setText(_translate("window_feature_encoding", "启用TF-IDF"))
         self.rbtn_qe.setText(_translate("window_feature_encoding", "启用扩展查询"))
         self.label_9.setText(_translate("window_feature_encoding", "输入参数"))

@@ -23,7 +23,7 @@ BOF_pxx = 1
 FV_pxx = 2
 # 重排序
 LC_pxx = 1  # 线性组合重排序
-CLUSTER_pxx = 2  # 基于聚类的重排序
+GEOMETRIC_pxx = 2  # 基于几何验证的重排序
 
 
 class Processor:

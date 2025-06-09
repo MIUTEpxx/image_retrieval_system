@@ -32,6 +32,9 @@ import numpy as np
 import cv2
 
 
+
+
+
 class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
     def __init__(self):
         super().__init__()
@@ -180,8 +183,8 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         start_time = time.time()  # 开始计时
         temp_descriptors = []  # 用于临时储存测试图和结果图的特征 用于后续扩展查询
         """测试图特征提取与编码"""
-        processor = IMGFP.Processor(self.feature_extraction_method)
-        _, test_desc = processor.extract_features(self.test_path)
+        processor = IMGFP.Processor(self.feature_extraction_method)  # 初始化特征提取器
+        test_kp, test_desc = processor.extract_features(self.test_path)   # 提取测试图片特征描述子
         if test_desc is None:
             QMessageBox.warning(self, "错误", "无法提取测试图像特征")
             return
@@ -217,8 +220,13 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
 
         """获取Top-K结果"""
         k = min(self.k_value, len(distances))
+        if k > len(self.train_encodings):
+            k = len(self.train_encodings)  # 避免K值大于训练集图像数量
+
+        # 使用np.argpartition高效地找到前k个最小距离的索引
         nearest_indices = np.argpartition(distances, k)[:k]
-        sorted_indices = nearest_indices[np.argsort(distances[nearest_indices])]
+        # 对这k个索引进行排序，以确保结果是按距离递增的
+        sorted_indices = nearest_indices[np.argsort(distances[nearest_indices])]  # 按相似度（距离）排序的图像索引
 
         # 构建结果列表
         results = []  # 格式 [(绝对路径,类别,相似度,idx)]
@@ -235,81 +243,96 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
                 return
             try:
                 # ================== 阶段1：获取候选结果 ==================
-                # 获取前K个结果的路径和索引（包含测试图自身）
+                # 获取前K个结果的 索引
                 topk_indices = sorted_indices[:self.k_value]
-                topk_paths = [self.test_path]  # 包含查询图像自身
+                # 获取前K个结果的 路径（包含测试图自身）
+                topk_paths = [self.test_path]  # 首先将查询图像自身的路径加入
                 for idx in topk_indices:
                     path, _ = self.train_image_paths[idx]
-                    topk_paths.append(path)
+                    topk_paths.append(path)  # 添加搜索结果的图像路径
 
                 # ================== 阶段2：几何验证 ,通过几何一致性验证，筛选出与查询图像在空间结构上一致的图像，排除误匹配==================
                 # 初始化几何验证参数
-                min_inliers = 10  # 最小内点数阈值 内点(inliers)：符合几何变换关系的匹配点 如果匹配点数量超过阈值（min_inliers=10），则认为候选图片A是有效的
+                min_inliers = 10  # 进行几何验证时所需的最小内点数 内点(inliers)：符合几何变换关系的匹配点
+                # 如果匹配点数量超过阈值（min_inliers=10），则认为候选图片A是有效的,
+                # 否则 如果匹配点经过单应性矩阵验证后，内点数量少于这个阈值，则认为几何一致性不足
+
                 validated_paths = [self.test_path]  # 始终包含原查询图
 
-                # 加载查询图的特征点
-                query_kp, query_desc = processor.extract_features(self.test_path)
+                # 提取测试图像的特征点（keypoints）和描述子（descriptors）
+                query_kp, query_desc = test_kp, test_desc  # 直接使用已提取的测试图特征
                 if query_desc is not None:
                     # 创建BFMatcher
-                    bf = cv2.BFMatcher(cv2.NORM_L2)  # 暴力匹配器，用于快速匹配特征点
-                    for cand_path in topk_paths[1:]:  # 跳过查询图自身
-                        # 提取候选图特征
+                    bf = cv2.BFMatcher(cv2.NORM_L2)  # 暴力匹配器，用于快速匹配特征点, cv2.NORM_L2 表示使用 L2 范数（欧氏距离）来计算描述子之间的距离
+                    for cand_path in topk_paths[1:]:  # [1:]跳过查询图自身
+                        # 提取当前候选图像的特征点和描述子。
                         cand_kp, cand_desc = processor.extract_features(cand_path)
                         if cand_desc is None:
                             continue
 
-                        # 特征匹配
+                        # 对查询图像和候选图像的描述子进行 K-Nearest Neighbors (KNN) 匹配, k=2 表示为每个查询描述子找到两个最近的匹配
                         matches = bf.knnMatch(query_desc, cand_desc, k=2)
+
                         # 应用比率测试 过滤掉不可靠的匹配（只保留最独特的匹配）
                         good = []
                         for m, n in matches:
+                            # 匹配点之间的距离比是否大于某个阈值（这里是 0.75!）
                             if m.distance < 0.75 * n.distance:
-                                good.append(m)
-                        if len(good) < min_inliers:
-                            continue  # 跳过低质量匹配
+                                good.append(m)  # 认为该匹配点是可靠的，否则认为是噪声或歧义匹配，将其舍弃
 
-                        # 进行单应性矩阵验证 使用RANSAC算法估计两张图片之间的几何变换关系
+                        if len(good) < min_inliers:
+                            continue  # 可靠的匹配点数量少于 min_inliers，则认为两张图像的特征匹配不足，跳过当前候选图像
+
+                        # 进行单应性矩阵验证 使用RANSAC算法估计两张图片之间的几何变换关系 (就像看两张图是不是同一个物体在不同角度、不同距离拍的 如果是，就保留；如果不是，就排除)
                         src_pts = np.float32([query_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
                         dst_pts = np.float32([cand_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+                        # 使用 RANSAC 算法（Random Sample Consensus）估计两组点之间的单应性矩阵
                         _, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-                        if mask.sum() > min_inliers:  # 有效几何验证
+                        # mask：RANSAC 算法返回一个掩码，其中 mask[i] 为 1 表示第 i 个匹配点是“内点”（inlier），即符合估计的单应性变换；为 0 表示是“外点”
+
+                        if mask.sum() > min_inliers:  # 如果内点数量大于 min_inliers，则认为查询图像与候选图像之间存在有效的几何一致性
                             validated_paths.append(cand_path)
 
-                # ================== 阶段3：动态权重计算 ==================
+                # ================== 阶段3：权重计算 ==================
                 # 获取验证通过的编码向量
-                validated_encodings = [test_encoding.ravel()]  # 展平为1D数组 查询图编码
+                validated_encodings = [test_encoding.ravel()]  # 展平为1D数组 初始值为测试图的编码
                 validated_sims = [1.0]  # 查询图自身相似度设为1
                 for path in validated_paths[1:]:
                     # 添加安全检查
                     try:
+                        # 通过路径查找该图像在训练集中的索引
                         idx_in_train = next(i for i, (p, _) in enumerate(self.train_image_paths) if p == path)
-                        encoding = self.train_encodings[idx_in_train]
+                        encoding = self.train_encodings[idx_in_train]  # 获取对应图像的特征编码
 
-                        # 统一维度处理
+                        # 统一维度处理 确保所有编码都是一维的，以进行后续的加权平均
                         if encoding.ndim == 2:
                             encoding = encoding.ravel()  # 展平为1D
                         elif encoding.ndim != 1:
                             raise ValueError(f"无效编码维度：{encoding.shape}")
 
-                        validated_encodings.append(encoding)
-                        validated_sims.append(1 - distances[idx_in_train])
+                        validated_encodings.append(encoding)  # 将通过验证的图像编码加入列表
+                        validated_sims.append(1 - distances[idx_in_train])  # 将该图像与查询图像的相似度（1减去距离）加入列表。距离越小，相似度越大
                     except (StopIteration, IndexError):
                         print(f"警告：未找到路径 {path} 的编码")
                         continue
 
-                # 动态调整K值（至少保留3个样本）
+                # 动态调整K值（至少保留3个样本 或 使用通过几何验证的图像数量的 70%）
                 K = max(3, int(len(validated_encodings) * 0.7))  # 保留70%的验证结果
 
-                # 计算权重（softmax归一化）
-                weights = np.exp(validated_sims) / np.sum(np.exp(validated_sims))
+                # 计算权重（softmax归一化, 将相似度转换为 0 到 1 之间的概率分布，所有权重之和为 1）
+                weights = np.exp(validated_sims) / np.sum(np.exp(validated_sims))  # 这意味着相似度越高的图像，其对应的权重越大，在后续的加权平均中贡献越大。
 
                 # ================== 阶段4：加权特征融合 ==================
+                # 把测试图片的特征和 阶段3 筛选出来的、打好权重的相关图片的特征加权平均起来
+                # 想象成把这些图片的特征“融合”成一个新的、更精准的“查询特征向量” 权重越大的图片，其特征在融合中贡献越大
+
                 # 转换前检查所有编码长度
                 dim_sizes = {e.shape[0] for e in validated_encodings}
-                if len(dim_sizes) != 1:
+                if len(dim_sizes) != 1:  # 确保所有参与融合的编码都具有相同的维度，防止因维度不一致导致的错误
                     raise ValueError(f"编码维度不一致：发现不同长度 {dim_sizes}")
-                stacked_encodings = np.array(validated_encodings)[:K]
-                stacked_weights = weights[:K]
+                stacked_encodings = np.array(validated_encodings)[:K]  # 表转换为 NumPy 数组，并根据动态调整后的 K 值截取前 K 个编码
+                stacked_weights = weights[:K]  # 截取前 K 个权重
 
                 # 加权平均
                 avg_encoding = np.average(stacked_encodings, axis=0, weights=stacked_weights)
@@ -334,9 +357,20 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
                 return
 
         """是否重排序"""
-        if self.re_sort_method == IMGFP.CLUSTER_pxx:
-            # 基于聚类的重排序
-            results = self.reorder_results(results, test_encoding)
+        if self.re_sort_method == IMGFP.GEOMETRIC_pxx:
+            # 基于几何验证的重排序
+            if not results:
+                QMessageBox.warning(self.ui, "警告", "无结果可重排序。")
+                self.display_results(results, time.time() - start_time)
+                return
+
+            # 准备几何验证所需的特征提取器和描述子
+            query_kp_for_resort = test_kp
+            query_desc_for_resort = test_desc
+
+            # 调用重排序方法
+            # 传递当前results和用于几何验证的查询特征
+            results = self.reorder_results(results, query_kp_for_resort, query_desc_for_resort, processor)
 
         # 更改格式以适应后续代码 # 格式 [(绝对路径,类别,相似度)]
         results_ = []
@@ -348,7 +382,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
 
         if self.re_sort_method == IMGFP.LC_pxx:
             # 启用基于线性组合的重排序
-            test_features = processor.extract_global_features(self.test_path)
+            test_features = processor.extract_global_features(self.test_path)  # 提取测试图像的颜色/形状/纹理特征
             # 执行重排序
             final_results = self.linear_reranking(processor, results, test_features)
             results = final_results
@@ -427,123 +461,44 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         self.lbl_class_num.setText(f"训练集中该类图像总数:{self.class_distribution[self.current_test_label]}")
         self.lbl_pr_all.setText(f"整体Pr曲线 累计次数: {len(self.ap_history)}")
 
-    def reorder_results(self, results, test_encoding):
-        """基于聚类的重排序方法"""
-        if not results:
-            return results
-
-        # 提取特征和验证有效性
-        features = []
-        valid_results = []
-        for result in results:
-            label, path, dist, idx = result
-            if idx < len(self.train_encodings):
-                feature = self.train_encodings[idx]
-                if feature is not None:
-                    features.append(feature)
-                    valid_results.append(result)
-
-        if len(features) < 2:  # 至少需要两个样本才能聚类
-            return results
-
-        # 动态确定聚类数（基于样本数量和轮廓系数）
-        max_clusters = min(10, len(features) // 2)  # 最多10个簇或样本数一半
-        min_clusters = 2
-        best_score = -1
-        best_labels = None
-        kmeans = None
-
-        # 评估不同聚类数
-        for n_clusters in range(min_clusters, max_clusters + 1):
-            try:
-                kmeans = MiniBatchKMeans(n_clusters=n_clusters, batch_size=100, random_state=0)
-                labels = kmeans.fit_predict(features)
-
-                # 计算轮廓系数（仅当n_clusters > 1）
-                if n_clusters > 1:
-                    from sklearn.metrics import silhouette_score
-                    score = silhouette_score(features, labels)
-                    if score > best_score:
-                        best_score = score
-                        best_labels = labels
-            except:
-                print("聚类的重排序, 出错!!!!!")
-                continue
-
-            # 如果没有找到合适聚类，退回原始顺序
-        if best_labels is None:
-            return results
-
-        # 获取最佳聚类标签
-        cluster_labels = best_labels
-        cluster_centers = kmeans.cluster_centers_
-
-        # 计算每个簇的综合得分（结合中心相似度和簇内一致性）
-        test_feature = test_encoding.reshape(1, -1)
-        cluster_scores = []
-        for k in range(len(cluster_centers)):
-            # 中心相似度
-            center_sim = 1 / (1 + np.linalg.norm(cluster_centers[k] - test_feature))
-
-            # 簇内平均相似度（处理空簇）
-            cluster_features = [features[i] for i, lbl in enumerate(cluster_labels) if lbl == k]
-            if len(cluster_features) == 0:
-                intra_sim = center_sim  # 空簇时使用中心相似度代替
-            else:
-                intra_sim = np.mean([1 / (1 + np.linalg.norm(f - test_feature)) for f in cluster_features])
-
-            # 综合得分（可调权重）
-            score = 0.6 * center_sim + 0.4 * intra_sim
-            cluster_scores.append(score)
-
-        # 按综合得分排序簇
-        sorted_cluster_indices = np.argsort(cluster_scores)[::-1]  # 降序
-
-        # 重新组织结果（优先高得分簇，簇内按原始距离排序）
-        reordered = []
-        for cluster_idx in sorted_cluster_indices:
-            # 获取当前簇结果
-            cluster_results = [res for res, lbl in zip(valid_results, cluster_labels) if lbl == cluster_idx]
-            # 簇内按原始距离排序
-            cluster_results_sorted = sorted(cluster_results, key=lambda x: x[2])
-            reordered.extend(cluster_results_sorted)
-
-        return reordered
-
     def linear_reranking(self, processor, initial_results, test_features,
                          weights={'color': 0.25, 'shape': 0.35, 'texture': 0.25, 'context': 0.15}):
-        """增强版线性融合重排序"""
-        rerank_scores = []
+        """基于 颜色/形状/纹理/类别 的线性组合重排序"""
+        rerank_scores = []  # 用于存储每个候选图像经过重排序后计算得到的综合得分及相关信息 最终这个列表将被用来进行排序
 
-        # 提前计算测试图全局特征
+        #  将查询图像的颜色、形状、纹理特征从 test_features 字典中分别提取出来，方便后续在循环中直接使用，避免重复通过字典键访问
         test_color = test_features['color']
         test_shape = test_features['shape']
         test_texture = test_features['texture']
 
         # 计算上下文相似度（同类图像占比）
-        class_counter = {}
+        #这部分是为了计算“上下文相似度”
+        # 一个简单的假设是，如果初始检索结果中某个类别的图像数量越多，那么该类别可能与查询图像更相关
+        # 这里的“上下文”指的是初始检索结果集中图像类别的分布
+        class_counter = {}  # 用于统计 initial_results 中每个图像类别（label）出现的次数
         for label, _, _ in initial_results:
             class_counter[label] = class_counter.get(label, 0) + 1
         total = len(initial_results)
 
         for idx, (label, path, base_dist) in enumerate(initial_results):
             # 基础相似度转换
-            base_sim = 1 / (1 + base_dist)
+            base_sim = 1 / (1 + base_dist)  # 将欧式距离转换为相似度
 
             # 提取候选图全局特征
-            candidate_features = processor.extract_global_features(path)
+            candidate_features = processor.extract_global_features(path)  # 提取颜色、形状和纹理特征
 
-            # 颜色相似度（改进巴氏距离）
+            # 颜色相似度（改进巴氏距离,越小越相似,通过 "1 - 距离" 的方式将其转换为相似度, 值越大表示颜色越相似）
             color_sim = 1 - cv2.compareHist(test_color, candidate_features['color'],
                                             cv2.HISTCMP_BHATTACHARYYA)
 
-            # 形状相似度（HOG余弦相似度）
+            # 形状相似度（HOG余弦相似度, 计算方式同上）
             shape_sim = 1 - spatial.distance.cosine(test_shape, candidate_features['shape'])
 
             # 纹理相似度（LBP卡方检验）
             texture_sim = cv2.compareHist(test_texture.astype(np.float32),
                                           candidate_features['texture'].astype(np.float32),
                                           cv2.HISTCMP_CHISQR)
+            # 卡方距离的值可以非常大（越大越不相似）, 这里采用 1 / (1 + 距离) 的方式将其转换为相似度
             texture_sim = 1 / (1 + texture_sim)  # 转换到[0,1]
 
             # 上下文相似度（同类结果占比）
@@ -571,6 +526,80 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
         # 按综合得分降序排序
         rerank_scores.sort(key=lambda x: -x[2])
         return rerank_scores
+
+    def reorder_results(self, results, query_kp, query_desc, feature_processor):
+        """
+        基于几何验证的重排序方法。
+        将通过几何验证的图像排序到结果队列的前面，否则排序到后面。
+        在通过和未通过的组内，保持原始距离排序。
+
+        results: 当前的检索结果列表 [(label, path, distance, original_idx), ...]
+        query_kp: 查询图像的关键点
+        query_desc: 查询图像的描述子
+        feature_processor: 用于提取候选图像特征的 Processor 实例
+        """
+        if not results or query_desc is None:
+            return results
+
+        min_inliers = 10  # 最小内点数阈值，与扩展查询中保持一致
+
+        geometric_verified_results = []
+        non_geometric_verified_results = []
+
+        # 创建BFMatcher
+        bf = cv2.BFMatcher(cv2.NORM_L2)  # 暴力匹配器，用于快速匹配特征点
+
+        for result_item in results:
+            label, img_path, dist, original_idx = result_item
+
+            try:
+                # 提取候选图特征
+                cand_kp, cand_desc = feature_processor.extract_features(img_path)
+                if cand_desc is None:
+                    non_geometric_verified_results.append(result_item)
+                    continue
+
+                # 特征匹配
+                matches = bf.knnMatch(query_desc, cand_desc, k=2)
+
+                # 应用比率测试
+                good = []
+                for m, n in matches:
+                    if m.distance < 0.75 * n.distance:
+                        good.append(m)
+
+                if len(good) < min_inliers:
+                    non_geometric_verified_results.append(result_item)
+                    continue
+
+                # 进行单应性矩阵验证
+                if len(good) < 4:  # RANSAC至少需要4个点
+                    non_geometric_verified_results.append(result_item)
+                    continue
+
+                src_pts = np.float32([query_kp[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+                dst_pts = np.float32([cand_kp[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+                M, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
+
+                if M is not None and mask.sum() > min_inliers:  # 通过几何验证
+                    geometric_verified_results.append(result_item)
+                else:
+                    non_geometric_verified_results.append(result_item)
+
+            except Exception as e:
+                print(f"几何重排序处理图片 {img_path} 时发生错误: {str(e)}")
+                non_geometric_verified_results.append(result_item)  # 出错的也放入未通过组
+
+        # 在各自的组内，保持原始距离排序
+        geometric_verified_results.sort(key=lambda x: x[2])
+        non_geometric_verified_results.sort(key=lambda x: x[2])
+
+        # 合并结果：通过几何验证的在前，未通过的在后
+        reordered_results = []
+        reordered_results.extend(geometric_verified_results)
+        reordered_results.extend(non_geometric_verified_results)
+
+        return reordered_results
 
     def show_result(self, results):
         """显示检测结果图像和信息"""
@@ -1244,7 +1273,7 @@ class main_window(QMainWindow, feature_encoding_UI.Ui_window_feature_encoding):
             print("关闭重排序重排序")
         elif self.re_sort_method == IMGFP.LC_pxx:
             print("启用基于线性组合的重排序算法")
-        elif self.re_sort_method == IMGFP.CLUSTER_pxx:
+        elif self.re_sort_method == IMGFP.GEOMETRIC_pxx:
             print("启用基于聚类的重排序算法")
 
 
